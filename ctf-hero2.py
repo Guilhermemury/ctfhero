@@ -30,17 +30,21 @@ class Colors:
 class CTFHero:
     def __init__(self, target_ip: str, options: argparse.Namespace):
         """Initialize CTF Hero with target IP and options"""
+        # Validate IP/hostname
+        if not self._is_valid_target(target_ip):
+            raise ValueError("Invalid IP or hostname")
+            
         self.target_ip = target_ip
         self.scan_method = "aggressive" if options.aggressive else "normal"
-        self.threads = options.threads
+        self.threads = min(max(1, options.threads), 50)  # Limit threads between 1 and 50
         self.quick_mode = options.quick
-        self.output_dir = options.output
+        self.output_dir = os.path.abspath(options.output)  # Convert to absolute path
         
         # Setup paths
         self.setup_paths()
         
         # Initialize other variables
-        self.hostname = "target.htb"
+        self.hostname = self._get_next_target_name()
         self.hosts_file = "/etc/hosts"
         self.start_time = time.time()
         
@@ -53,6 +57,78 @@ class CTFHero:
         
         # Setup wordlists
         self.setup_wordlists()
+        
+        # Configuração de timeouts
+        self.timeouts = {
+            'curl': 10,
+            'nmap': 3600 if not self.quick_mode else 1800,
+            'ffuf': 300 if not self.quick_mode else 120,
+            'whatweb': 30
+        }
+
+    def _is_valid_target(self, target: str) -> bool:
+        """Valida se o target é um IP ou hostname válido"""
+        # Padrão para IPv4
+        ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+        # Padrão para hostname
+        hostname_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$'
+        
+        if re.match(ipv4_pattern, target):
+            # Valida se cada octeto está entre 0 e 255
+            return all(0 <= int(x) <= 255 for x in target.split('.'))
+        elif re.match(hostname_pattern, target):
+            return True
+        return False
+
+    def _safe_run_command(self, cmd: List[str], timeout: int = None, check: bool = True) -> subprocess.CompletedProcess:
+        """Executa um comando de forma segura com timeout e tratamento de erros"""
+        try:
+            return subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=check
+            )
+        except subprocess.TimeoutExpired as e:
+            self.log("WARNING", f"Comando excedeu o timeout de {timeout}s: {' '.join(cmd)}")
+            raise
+        except subprocess.CalledProcessError as e:
+            self.log("ERROR", f"Comando falhou com código {e.returncode}: {' '.join(cmd)}")
+            if e.stderr:
+                self.log("ERROR", f"Erro: {e.stderr.strip()}")
+            raise
+        except Exception as e:
+            self.log("ERROR", f"Erro ao executar comando {' '.join(cmd)}: {str(e)}")
+            raise
+
+    def _cleanup_old_files(self):
+        """Limpa arquivos antigos do diretório de saída"""
+        try:
+            # Mantém apenas os últimos 5 relatórios
+            report_files = sorted(
+                [f for f in os.listdir(self.output_dir) if f.endswith('.md')],
+                key=lambda x: os.path.getmtime(os.path.join(self.output_dir, x)),
+                reverse=True
+            )
+            
+            for old_file in report_files[5:]:
+                try:
+                    os.remove(os.path.join(self.output_dir, old_file))
+                except Exception:
+                    pass
+                    
+            # Limpa arquivos temporários
+            for temp_file in os.listdir(self.output_dir):
+                if temp_file.startswith('temp_') or temp_file.endswith('.tmp'):
+                    try:
+                        os.remove(os.path.join(self.output_dir, temp_file))
+                    except Exception:
+                        pass
+                        
+        except Exception as e:
+            self.log("WARNING", f"Erro ao limpar arquivos antigos: {e}")
 
     def setup_paths(self):
         """Setup directory structure and file paths"""
@@ -213,54 +289,80 @@ class CTFHero:
         
         self.log("SUCCESS", "Wordlists check completed")
 
-    def update_hosts_file(self, domain: str) -> bool:
-        """Add entries to /etc/hosts file with backup verification"""
-        # Create backup of hosts file if it doesn't exist
-        if not os.path.exists(f"{self.hosts_file}.bak"):
-            try:
-                shutil.copy(self.hosts_file, f"{self.hosts_file}.bak")
-                self.log("INFO", f"Hosts file backup created at {self.hosts_file}.bak")
-            except PermissionError:
-                self.log("ERROR", "No permission to backup hosts file. Run with sudo.")
-                return False
-            except Exception as e:
-                self.log("ERROR", f"Failed to backup hosts file: {e}")
-                return False
-        
-        # Check if domain already exists in hosts file
+    def _get_next_target_name(self) -> str:
+        """Get the next available target name in format targetN.htb"""
         try:
+            if not os.path.exists(self.hosts_file):
+                return "target1.htb"
+            
             with open(self.hosts_file, 'r') as f:
                 content = f.read()
-                if f"{self.target_ip} {domain}" in content:
-                    self.log("INFO", f"Domain {domain} already exists in hosts file")
-                    return False
+                
+            # Procura por padrões targetN.htb no arquivo
+            target_pattern = r'target(\d+)\.htb'
+            matches = re.findall(target_pattern, content)
             
-            # Add domain to hosts file
-            with open(self.hosts_file, 'a') as f:
-                f.write(f"{self.target_ip} {domain}\n")
+            if not matches:
+                return "target1.htb"
+            
+            # Encontra o maior número usado
+            max_num = max(int(num) for num in matches)
+            return f"target{max_num + 1}.htb"
+            
+        except Exception as e:
+            self.log("WARNING", f"Erro ao determinar nome do target: {e}")
+            return "target1.htb"
+
+    def update_hosts_file(self, domain: str = None) -> bool:
+        """Add entry to /etc/hosts file with backup verification"""
+        if not os.access(self.hosts_file, os.W_OK):
+            self.log("ERROR", "No write permission on hosts file. Run with sudo.")
+            return False
+            
+        # If no domain provided, use default hostname
+        if domain is None:
+            domain = self.hostname
+            
+        # Create backup of hosts file if it doesn't exist
+        backup_file = f"{self.hosts_file}.bak"
+        if not os.path.exists(backup_file):
+            try:
+                shutil.copy2(self.hosts_file, backup_file)  # Use copy2 to preserve metadata
+                self.log("INFO", f"Hosts file backup created at {backup_file}")
+            except Exception as e:
+                self.log("ERROR", f"Failed to create hosts file backup: {e}")
+                return False
+        
+        try:
+            # Read current file content
+            with open(self.hosts_file, 'r') as f:
+                lines = f.readlines()
+            
+            # Remove empty lines and comments
+            lines = [line.strip() for line in lines if line.strip() and not line.startswith('#')]
+            
+            # Remove any existing entry for the IP
+            new_lines = [line for line in lines if not line.startswith(self.target_ip)]
+            
+            # Add new entry
+            new_entry = f"{self.target_ip} {domain}\n"
+            
+            # Write file safely using temporary file
+            temp_file = f"{self.hosts_file}.tmp"
+            try:
+                with open(temp_file, 'w') as f:
+                    f.write('\n'.join(new_lines) + '\n' + new_entry)
+                os.replace(temp_file, self.hosts_file)  # Atomic replacement
                 self.log("SUCCESS", f"Domain {domain} ({self.target_ip}) added to hosts file")
                 return True
+            except Exception as e:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                raise e
                 
-        except PermissionError:
-            self.log("ERROR", f"No permission to modify hosts file. Run with sudo.")
-            return False
         except Exception as e:
             self.log("ERROR", f"Failed to update hosts file: {e}")
             return False
-
-    def restore_hosts_file(self):
-        """Restore hosts file from backup"""
-        backup_file = f"{self.hosts_file}.bak"
-        if os.path.exists(backup_file):
-            try:
-                shutil.copy(backup_file, self.hosts_file)
-                self.log("SUCCESS", "Hosts file restored from backup")
-            except PermissionError:
-                self.log("ERROR", "No permission to restore hosts file. Run with sudo.")
-            except Exception as e:
-                self.log("ERROR", f"Failed to restore hosts file: {e}")
-        else:
-            self.log("WARNING", "Hosts file backup not found")
 
     def scan_ports(self) -> bool:
         """Scan open ports on the target"""
@@ -271,34 +373,32 @@ class CTFHero:
         try:
             self.log("INFO", "Running port scan...")
             
+            # Prepare nmap command based on mode
             if self.quick_mode:
-                # Quick scan on common ports
                 common_ports = "21,22,23,25,53,80,88,110,111,135,139,143,389,443,445,464,587,636,1433,1521,2049,3306,3389,5432,5985,5986,8080,8443,9090"
                 cmd = ["nmap", "-sS", "--min-rate=1000", "-T4", "-p", common_ports, self.target_ip, "-oN", nmap_output_file]
             elif self.scan_method == "aggressive":
-                cmd = ["nmap", "-p-", "--min-rate=5000", "-T5", self.target_ip, "-oN", nmap_output_file]
+                cmd = ["nmap", "-p-", "--min-rate=5000", "-T5", "--max-retries=2", self.target_ip, "-oN", nmap_output_file]
             else:
-                cmd = ["nmap", "-sS", "-p-", "--min-rate=1000", "-T4", self.target_ip, "-oN", nmap_output_file]
+                cmd = ["nmap", "-sS", "-p-", "--min-rate=1000", "-T4", "--max-retries=3", self.target_ip, "-oN", nmap_output_file]
             
-            # Run nmap and capture output
-            process = subprocess.run(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE,
-                text=True
-            )
+            # Execute command with timeout
+            process = self._safe_run_command(cmd, timeout=self.timeouts['nmap'])
             
-            # Show real-time output of command
-            self.log("INFO", f"nmap command output:")
+            # Show real-time output
+            self.log("INFO", "Nmap command output:")
             for line in process.stdout.split('\n'):
                 if line.strip() and not line.startswith('#'):
                     print(f"  {line}")
             
-            # Parse open ports
+            # Process open ports
             self._parse_open_ports(nmap_output_file)
             
             return bool(self.all_ports)
             
+        except subprocess.TimeoutExpired:
+            self.log("ERROR", "Port scan exceeded time limit")
+            return False
         except Exception as e:
             self.log("ERROR", f"Port scan failed: {e}")
             return False
@@ -332,7 +432,7 @@ class CTFHero:
                 self.log("SUCCESS", f"Found {len(self.all_ports)} open ports: {port_str}")
                 
                 # Identify standard web ports
-                web_ports = [p for p in self.all_ports if p in [80, 443, 81, 8000, 8080, 8081, 8443, 3000, 8800, 8888, 8834, 5000, 5001, 9000, 9001, 9090, 9443]]
+                web_ports = [p for p in self.all_ports if p in [80, 443, 81, 8000, 8080, 8081, 8443, 3000, 8800, 8888, 8834, 5000, 5001, 9000, 9001, 9090]]
                 
                 if web_ports:
                     self.web_ports = web_ports
@@ -556,7 +656,7 @@ class CTFHero:
                                 if "://" in line:
                                     domain = line.split("://")[1].split("/")[0].split(":")[0]
                                     domains_found.append(domain)
-                                    self.log("SUCCESS", f"Found domain: {domain}")
+                                    self.log("SUCCESS", f"Domain found: {domain}")
 
                 # Save unique domains
                 if domains_found:
@@ -590,30 +690,25 @@ class CTFHero:
                                 for domain in matches:
                                     if "." in domain and domain not in ["w3.org", "www.w3.org"]:
                                         self.domains_found.add(domain)
-                                        self.log("SUCCESS", f"Found domain in content: {domain}")
+                                        self.log("SUCCESS", f"Domain found in content: {domain}")
             except Exception as e:
                 self.log("ERROR", f"Failed to discover domains on port {port}: {e}")
 
-        # Update hosts file with discovered domains
+        # Save discovered domains but use only standardized name in hosts
         if self.domains_found:
             self.log("SUCCESS", f"Found {len(self.domains_found)} potential domains")
             domains_file = os.path.join(self.scan_dir, "domains.txt")
             with open(domains_file, 'w') as f:
                 for domain in sorted(self.domains_found):
                     f.write(f"{domain}\n")
-                    # Update hosts file with discovered domain
-                    self.update_hosts_file(domain)
-
-            # Set default hostname if found
-            if self.domains_found:
-                self.hostname = next(iter(self.domains_found))
-                self.log("INFO", f"Setting default hostname to: {self.hostname}")
-
+            
+            # Update hosts file with standardized name
+            self.update_hosts_file()
             return True
         else:
             self.log("WARNING", "No domains discovered")
-            # If no domain found, add target.htb to hosts file
-            self.update_hosts_file("target.htb")
+            # If no domains found, use standardized name
+            self.update_hosts_file()
             return False
 
     def scan_web_services(self):
@@ -704,6 +799,18 @@ class CTFHero:
 
         self.log("INFO", f"Identifying web technologies for {url}...")
 
+        # Lista de tecnologias relevantes para busca de vulnerabilidades
+        relevant_techs = {
+            'CMS': ['wordpress', 'joomla', 'drupal', 'magento', 'shopify'],
+            'Web Framework': ['django', 'rails', 'laravel', 'spring', 'express', 'flask'],
+            'Web Server': ['apache', 'nginx', 'iis', 'tomcat', 'jetty'],
+            'Database': ['mysql', 'postgresql', 'mongodb', 'sqlite', 'oracle'],
+            'Programming Language': ['php', 'python', 'ruby', 'java', 'node.js', 'asp.net'],
+            'Security': ['waf', 'firewall', 'ssl', 'tls'],
+            'Authentication': ['basic-auth', 'digest-auth', 'oauth', 'jwt'],
+            'Application Server': ['glassfish', 'jboss', 'weblogic', 'websphere']
+        }
+
         try:
             process = subprocess.run(
                 ["whatweb", "-a", "3", "--color=never", "--log-json=" + whatweb_file, url],
@@ -723,7 +830,14 @@ class CTFHero:
                             if plugins:
                                 self.log("SUCCESS", f"Web technologies found for {url}:")
                                 for tech, info in plugins.items():
-                                    if tech.lower() not in ['title', 'ip', 'script', 'html', 'object', 'meta-author']:
+                                    # Verifica se a tecnologia é relevante
+                                    is_relevant = False
+                                    for category, techs in relevant_techs.items():
+                                        if any(t in tech.lower() for t in techs):
+                                            is_relevant = True
+                                            break
+                                    
+                                    if is_relevant:
                                         tech_str = f"{tech}"
                                         if isinstance(info, dict) and 'version' in info:
                                             tech_str += f" {info['version']}"
@@ -790,33 +904,61 @@ class CTFHero:
             self.log("SUCCESS", f"All potential web exploits saved to {exploits_file}")
 
     def _enumerate_directories(self, url, parsed_url):
-        """Enumerate directories and files using ffuf"""
+        """Enumerate directories and files using ffuf with optimized settings"""
         self.log("INFO", f"Enumerating directories and files for {url}...")
 
         # Set up ffuf output file
         ffuf_dir = os.path.join(self.scan_dir, "ffuf")
         ffuf_output = os.path.join(ffuf_dir, f"{parsed_url}_dirs.json")
-
-        # Choose wordlist based on quick mode
-        wordlist = self.wordlist_quickfiles if self.quick_mode else self.wordlist_directories
-
+        
+        # Smart wordlist selection based on target characteristics
+        wordlist = self._select_optimal_wordlist(url)
+        
+        # Get baseline response size for better filtering
+        baseline_size = self._get_baseline_response_size(url)
+        
         try:
-            # Execute ffuf with selected wordlist
+            # Base ffuf command with optimized settings
             cmd = [
-                "ffuf", "-u", f"{url}/FUZZ",
+                "ffuf",
+                "-u", f"{url}/FUZZ",
                 "-w", wordlist,
-                "-mc", "200,204,301,302,307,401,403,405",
-                "-c",
-                "-t", str(self.threads),
+                "-mc", "200,204,301,302,307,401,403,405",  # Common success status codes
+                "-c",  # Color output
+                "-t", str(min(self.threads, 40)),  # Limit max threads to 40
                 "-o", ffuf_output,
-                "-of", "json"
+                "-of", "json",
+                "-rate", "100",  # Rate limit requests per second
+                "-p", "0.1",  # Delay between requests
+                "-recursion",  # Enable recursion for found directories
+                "-recursion-depth", "2",  # Limit recursion depth
+                "-recursion-strategy", "greedy",  # Use greedy strategy for recursion
+                "-timeout", "10",  # Timeout for requests
+                "-max-time", "300" if not self.quick_mode else "120",  # Overall scan timeout
             ]
 
-            # Add some filtering to reduce false positives
-            cmd.extend(["-fs", "0"])
+            # Add smart filtering based on baseline response
+            if baseline_size > 0:
+                # Filter out responses that are too similar to baseline
+                cmd.extend([
+                    "-fs", f"{baseline_size - 10}",  # Filter responses smaller than baseline
+                    "-fw", "0",  # Filter responses with 0 words
+                ])
+
+            # Add additional filters for common false positives
+            cmd.extend([
+                "-fc", "404,429,503",  # Filter out common error codes
+                "-fl", "0",  # Filter out empty responses
+            ])
+
+            # Add extensions to test if it's a web application
+            if self._is_web_application(url):
+                cmd.extend([
+                    "-e", "php,asp,aspx,jsp,html,htm,js,txt,json,xml,yml,yaml,conf,config,bak,old,zip,tar,gz,sql",  # Common extensions
+                ])
 
             # Run the command with a timeout
-            self.log("INFO", f"Running directory enumeration with ffuf...")
+            self.log("INFO", f"Running optimized directory enumeration with ffuf...")
             process = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -835,6 +977,72 @@ class CTFHero:
             self.log("WARNING", f"ffuf scan timed out for {url}")
         except Exception as e:
             self.log("ERROR", f"ffuf scan failed: {e}")
+
+    def _select_optimal_wordlist(self, url: str) -> str:
+        """Select the most appropriate wordlist based on target characteristics"""
+        try:
+            # Try to identify if it's a common CMS or framework
+            process = subprocess.run(
+                ["whatweb", "-a", "1", "--color=never", url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=10
+            )
+            
+            output = process.stdout.lower()
+            
+            # Select wordlist based on detected technologies
+            if "wordpress" in output:
+                return "/usr/share/seclists/Discovery/Web-Content/CMS/wordpress.txt"
+            elif "joomla" in output:
+                return "/usr/share/seclists/Discovery/Web-Content/CMS/joomla.txt"
+            elif "drupal" in output:
+                return "/usr/share/seclists/Discovery/Web-Content/CMS/drupal.txt"
+            elif "apache" in output or "nginx" in output:
+                return "/usr/share/seclists/Discovery/Web-Content/apache.txt"
+            elif self.quick_mode:
+                return self.wordlist_quickfiles
+            else:
+                return self.wordlist_directories
+                
+        except Exception:
+            # Fallback to default wordlist
+            return self.wordlist_quickfiles if self.quick_mode else self.wordlist_directories
+
+    def _get_baseline_response_size(self, url: str) -> int:
+        """Get baseline response size for better filtering"""
+        try:
+            process = subprocess.run(
+                ["curl", "-s", "--connect-timeout", "5", "--max-time", "10", url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True
+            )
+            return len(process.stdout)
+        except Exception:
+            return 0
+
+    def _is_web_application(self, url: str) -> bool:
+        """Check if the target is likely a web application"""
+        try:
+            process = subprocess.run(
+                ["curl", "-s", "--connect-timeout", "5", "--max-time", "10", "-I", url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True
+            )
+            
+            headers = process.stdout.lower()
+            return any(x in headers for x in [
+                "content-type: text/html",
+                "content-type: application/json",
+                "x-powered-by:",
+                "server:",
+                "set-cookie:"
+            ])
+        except Exception:
+            return True  # Assume it's a web app if we can't determine
 
     def _parse_ffuf_results(self, ffuf_output, base_url):
         """Parse ffuf results and check for interesting files"""
@@ -1074,35 +1282,53 @@ class CTFHero:
 
     def run(self):
         """Run the CTF Hero scanning process"""
-        # Print banner
-        self.print_banner()
+        try:
+            # Print banner
+            self.print_banner()
 
-        # Check requirements
-        self.check_requirements()
+            # Clean up old files
+            self._cleanup_old_files()
 
-        # Initial port scanning
-        self.log("INFO", f"Starting scan on target {self.target_ip}")
+            # Check requirements
+            self.check_requirements()
 
-        if not self.scan_ports():
-            self.log("ERROR", "Initial port scan failed or found no open ports")
+            # Initial port scanning
+            self.log("INFO", f"Starting scan on target {self.target_ip}")
+
+            if not self.scan_ports():
+                self.log("ERROR", "Initial port scan failed or found no open ports")
+                return False
+
+            # Detailed port scanning
+            self.detailed_scan()
+
+            # Web service discovery
+            if self.web_ports:
+                self.discover_domains()
+                self.scan_web_services()
+
+            # Generate report
+            self.generate_report()
+
+            # Display scan duration
+            duration = self._format_duration(time.time() - self.start_time)
+            self.log("SUCCESS", f"Scan completed in {duration}")
+
+            return True
+
+        except KeyboardInterrupt:
+            self.log("WARNING", "Scan interrupted by user")
             return False
-
-        # Detailed port scanning
-        self.detailed_scan()
-
-        # Web service discovery
-        if self.web_ports:
-            self.discover_domains()
-            self.scan_web_services()
-
-        # Generate report
-        self.generate_report()
-
-        # Display scan duration
-        duration = self._format_duration(time.time() - self.start_time)
-        self.log("SUCCESS", f"Scan completed in {duration}")
-
-        return True
+        except Exception as e:
+            self.log("ERROR", f"Scan failed: {e}")
+            return False
+        finally:
+            # Ensure hosts file is restored in case of error
+            if os.path.exists(f"{self.hosts_file}.bak"):
+                try:
+                    shutil.copy2(f"{self.hosts_file}.bak", self.hosts_file)
+                except Exception as e:
+                    self.log("ERROR", f"Failed to restore hosts file: {e}")
 
 
 def handle_signal(signum, frame):
